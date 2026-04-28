@@ -72,6 +72,8 @@ def solve_pv_with_raim(sat_p, sat_v, prs, dops, initial_guess, C=299792458.0, L1
     # RAIM Loop for Position
     while len(valid_idx) >= 4:
         x_temp = x.copy()
+        
+        # Weighted Least Squares (WLS)
         for _ in range(10):
             H, dP, W = [], [], []
             up_vec = x_temp[:3] / np.linalg.norm(x_temp[:3])
@@ -79,6 +81,7 @@ def solve_pv_with_raim(sat_p, sat_v, prs, dops, initial_guess, C=299792458.0, L1
             for i in valid_idx:
                 vec = sat_p[i] - x_temp[:3]
                 d = np.linalg.norm(vec)
+                # Cap minimum elevation at 5 degrees to prevent divide-by-zero
                 el = max(np.arcsin(np.dot(vec, up_vec) / d), 0.087)
 
                 H.append([-vec[0]/d, -vec[1]/d, -vec[2]/d, 1.0])
@@ -89,10 +92,12 @@ def solve_pv_with_raim(sat_p, sat_v, prs, dops, initial_guess, C=299792458.0, L1
             try:
                 update = np.linalg.solve(H.T @ W @ H, H.T @ W @ dP)
                 x_temp += update
+                # If the update is tiny, we have converged on a position
                 if np.linalg.norm(update[:3]) < 1e-3: break
-            except: break
+            except: 
+                break
 
-        # Check Residuals
+        # Check Residuals (How far off is the math from the raw GPS data?)
         residuals = []
         up_vec = x_temp[:3] / np.linalg.norm(x_temp[:3])
         for i in valid_idx:
@@ -102,14 +107,18 @@ def solve_pv_with_raim(sat_p, sat_v, prs, dops, initial_guess, C=299792458.0, L1
             res = abs(prs[i] - (d + x_temp[3] + 2.4/np.sin(el)))
             residuals.append(res)
 
-        # Reject bad satellites (over 100m error)
-        max_res = max(residuals)
-        if max_res > 100:
+        # --- THE FIX: Relaxed Neighborhood Threshold ---
+        max_res = max(residuals) if residuals else 0
+        
+        # 1. Increased threshold from 100m to 400m
+        # 2. Safety lock: Do not pop if we are at exactly 4 satellites (starvation)
+        if max_res > 400 and len(valid_idx) > 4:
             valid_idx.pop(residuals.index(max_res))
         else:
             x = x_temp
             break 
 
+    # If we somehow fell below 4, the epoch is dead
     if len(valid_idx) < 4: return None, None
 
     # Velocity Solve
@@ -125,93 +134,117 @@ def solve_pv_with_raim(sat_p, sat_v, prs, dops, initial_guess, C=299792458.0, L1
         
     try:
         v = np.linalg.solve(np.array(H_v).T @ np.array(H_v), np.array(H_v).T @ np.array(dD))
-    except: v = np.zeros(4)
+    except: 
+        v = np.zeros(4)
+        
     return x, v
 
 def main():
     C = 299792458.0
     ISRAEL_CENTER = np.array([4438000.0, 3085000.0, 3369000.0, 0.0])
     
-    print("Loading RINEX files...")
-    obs_data = gr.load(r'rinex_files\gnss_log_2026_03_21_17_14_34.26o', use='G') 
-    nav_data = gr.load(r'rinex_files\BRDC00IGS_R_20260800000_01D_MN.rnx', use='G')
+    # 1. Put BOTH of your observation files in a list
+    obs_files = [
+        r'rinex_files\gnss_log_2026_03_21_17_14_34.26o', 
+        r'rinex_files\gnss_log_2026_03_21_17_17_57.26o'
+    ]
     
-    # Using strict EPSG codes: ECEF to WGS84 (Lon, Lat, Alt)
+    print("Loading Navigation Data...")
+    nav_data = gr.load(r'rinex_files\BRDC00IGS_R_20260800000_01D_MN.rnx', use='G')
     transformer = Transformer.from_crs("EPSG:4978", "EPSG:4326", always_xy=True)
     
+    # These states will persist across BOTH files, connecting the path
     last_p, last_v, last_time = None, np.zeros(3), None
     results = []
 
     MAP = { 'af0': ['af0', 'SVclockBias'], 'af1': ['af1', 'SVclockDrift'], 'af2': ['af2', 'SVclockDriftRate'], 'Toe': ['Toe', 'time'], 'sqrtA': ['sqrtA'], 'Eccentricity': ['Eccentricity'], 'Io': ['Io'], 'Omega0': ['Omega0'], 'omega': ['omega'], 'M0': ['M0'], 'DeltaN': ['DeltaN'], 'OmegaDot': ['OmegaDot'], 'IDOT': ['IDOT'], 'Cuc': ['Cuc'], 'Cus': ['Cus'], 'Crc': ['Crc'], 'Crs': ['Crs'], 'Cic': ['Cic'], 'Cis': ['Cis'] }
 
-    print("Solving accurate path...")
-    for epoch_time in obs_data.time.values:
-        obs_epoch = obs_data.sel(time=epoch_time)
-        sat_p, sat_v, prs, dops = [], [], [], []
-        
-        # --- THE TIME BUG FIX ---
-        # RINEX observation time is ALREADY GPS Time. Do not add 18 seconds!
-        t_gps = pd.to_datetime(epoch_time)
-        # Strip timezone data to prevent Python from shifting it based on your PC's clock
-        if t_gps.tzinfo is not None: t_gps = t_gps.tz_localize(None) 
-        
-        dt = (t_gps - last_time).total_seconds() if last_time is not None else 1.0
-        last_time = t_gps
-        
-        # Seconds since Jan 6 1980
-        tow = (t_gps - pd.Timestamp('1980-01-06')).total_seconds() % 604800 
+    print("Solving Combined Path...")
+    
+    # 2. Loop through both files sequentially
+    for file_path in obs_files:
+        print(f"Processing {file_path}...")
+        try:
+            obs_data = gr.load(file_path, use='G')
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            continue
 
-        for sv in obs_epoch.sv.values:
-            pr = obs_epoch['C1C'].sel(sv=sv).values if 'C1C' in obs_epoch else np.nan
-            dop = obs_epoch['D1C'].sel(sv=sv).values if 'D1C' in obs_epoch else np.nan
-            snr = obs_epoch['S1C'].sel(sv=sv).values if 'S1C' in obs_epoch else 35.0
+        for epoch_time in obs_data.time.values:
+            obs_epoch = obs_data.sel(time=epoch_time)
+            sat_p, sat_v, prs, dops = [], [], [], []
             
-            # Lowered SNR threshold to 20 to ensure we don't drop too many good points
-            if not np.isnan(pr) and not np.isnan(dop) and not np.isnan(snr) and snr >= 20.0 and sv in nav_data.sv:
-                try:
-                    nav_msg = nav_data.sel(sv=sv).dropna(dim='time', how='all').sel(time=epoch_time, method='nearest', tolerance=pd.Timedelta(hours=4))
-                    n_d = {'pr': pr}
-                    for k, opts in MAP.items():
-                        for o in opts:
-                            if o in nav_msg: n_d[k] = float(nav_msg[o].values); break
-                    
-                    s_p, s_v, s_c = calculate_satellite_data(n_d, tow - (pr/C))
-                    sat_p.append(s_p); sat_v.append(s_v); prs.append(pr + (s_c * C)); dops.append(dop)
-                except: continue
-                    
-        if len(prs) >= 4:
-            guess = ISRAEL_CENTER if last_p is None else last_p
-            p_raw, v_raw = solve_pv_with_raim(sat_p, sat_v, prs, dops, guess)
+            t_gps = pd.to_datetime(epoch_time)
+            if t_gps.tzinfo is not None: t_gps = t_gps.tz_localize(None) 
             
-            if p_raw is not None:
-                # Basic Kinematic Smoothing 
-                if last_p is not None and np.linalg.norm(v_raw[:3]) < 40:
-                    p_pred = last_p[:3] + (last_v * dt)
-                    p_final = (0.2 * p_raw[:3]) + (0.8 * p_pred)
-                else:
-                    p_final = p_raw[:3]
+            dt = (t_gps - last_time).total_seconds() if last_time is not None else 1.0
+            tow = (t_gps - pd.Timestamp('1980-01-06')).total_seconds() % 604800 
 
-                last_p = np.append(p_final, p_raw[3])
-                last_v = v_raw[:3]
+            for sv in obs_epoch.sv.values:
+                pr = float(obs_epoch['C1C'].sel(sv=sv).values) if 'C1C' in obs_epoch else np.nan
+                dop = float(obs_epoch['D1C'].sel(sv=sv).values) if 'D1C' in obs_epoch else np.nan
                 
-                lon, lat, alt = transformer.transform(p_final[0], p_final[1], p_final[2])
-                results.append({'UTC': t_gps.strftime('%H:%M:%S'), 'Lat': lat, 'Lon': lon, 'Alt': alt, 'Vx': v_raw[0], 'Vy': v_raw[1], 'Vz': v_raw[2]})
+                if not np.isnan(pr) and sv in nav_data.sv:
+                    try:
+                        nav_msg = nav_data.sel(sv=sv).dropna(dim='time', how='all').sel(time=epoch_time, method='nearest', tolerance=pd.Timedelta(hours=4))
+                        n_d = {'pr': pr}
+                        for k, opts in MAP.items():
+                            for o in opts:
+                                if o in nav_msg: n_d[k] = float(nav_msg[o].values); break
+                        
+                        s_p, s_v, s_c = calculate_satellite_data(n_d, tow - (pr/C))
+                        sat_p.append(s_p); sat_v.append(s_v); prs.append(pr + (s_c * C))
+                        dops.append(dop if not np.isnan(dop) else 0.0)
+                    except: continue
+                        
+            if len(prs) >= 4:
+                guess = ISRAEL_CENTER if last_p is None else last_p
+                p_raw, v_raw = solve_pv_with_raim(sat_p, sat_v, prs, dops, guess)
+                
+                if p_raw is not None:
+                    if last_p is not None:
+                        # If dt > 5, it means we hit the 84-second gap between files.
+                        # We ignore velocity prediction and start fresh so it doesn't jump wildly.
+                        if np.linalg.norm(v_raw[:3]) < 40 and dt < 5:
+                            p_pred = last_p[:3] + (last_v * dt)
+                            p_final = (0.4 * p_raw[:3]) + (0.6 * p_pred)
+                        else:
+                            p_final = p_raw[:3]
+                    else:
+                        p_final = p_raw[:3]
+
+                    last_time = t_gps
+                    last_p = np.append(p_final, p_raw[3])
+                    last_v = v_raw[:3]
+                    
+                    lon, lat, alt = transformer.transform(p_final[0], p_final[1], p_final[2])
+                    results.append({'UTC': t_gps.strftime('%H:%M:%S'), 'Lat': lat, 'Lon': lon, 'Alt': alt})
 
     if results:
         df = pd.DataFrame(results)
-        
-        # Drop extreme outliers (Lat/Lon should be in Israel roughly)
         df = df[(df['Lat'] > 29) & (df['Lat'] < 34) & (df['Lon'] > 33) & (df['Lon'] < 36)]
         
-        df['Lat'] = df['Lat'].rolling(3, min_periods=1, center=True).mean()
-        df['Lon'] = df['Lon'].rolling(3, min_periods=1, center=True).mean()
+        # Smooth the combined path
+        df['Lat'] = df['Lat'].rolling(5, min_periods=1, center=True).mean()
+        df['Lon'] = df['Lon'].rolling(5, min_periods=1, center=True).mean()
         
-        df.to_csv("gnss_final_accurate.csv", index=False)
+        df.to_csv("gnss_full_neighborhood.csv", index=False)
         
         kml = simplekml.Kml()
-        kml.newlinestring(name="Accurate Path", coords=[(r['Lon'], r['Lat'], r['Alt']) for i, r in df.iterrows()]).style.linestyle.color = 'ff00ffff'
-        kml.save("gnss_final_accurate.kml")
-        print(f"SUCCESS: Exported {len(df)} points.")
+        ls = kml.newlinestring(name="Full Neighborhood Path")
+        ls.coords = [(r['Lon'], r['Lat'], r['Alt']) for i, r in df.iterrows()]
+        ls.altitudemode = simplekml.AltitudeMode.clamptoground
+        ls.tessellate = 1
+        ls.style.linestyle.color = 'ff00ffff' 
+        ls.style.linestyle.width = 4          
+        
+        start_row = df.iloc[0]
+        start_pin = kml.newpoint(name="START", coords=[(start_row['Lon'], start_row['Lat'], start_row['Alt'])])
+        start_pin.style.labelstyle.scale = 1.0
+        start_pin.style.iconstyle.color = 'ff00ff00'
+        
+        kml.save("gnss_full_neighborhood.kml")
+        print(f"SUCCESS: Exported {len(df)} points. Maximum yield achieved across BOTH files.")
     else:
         print("No points computed.")
 
