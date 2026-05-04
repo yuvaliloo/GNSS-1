@@ -145,11 +145,11 @@ def main():
     
     # 1. Put BOTH of your observation files in a list
     obs_files = [ 
-        r'rinex_files\gnss_log_2026_03_22_08_44_21.26o'
+        r'rinex_files\gnss_log_2026_03_21_17_17_57.26o'
     ]
     
     print("Loading Navigation Data...")
-    nav_data = gr.load(r'rinex_files\BRDC00IGS_R_20260810000_01D_MN.rnx', use='G')
+    nav_data = gr.load(r'rinex_files\BRDC00IGS_R_20260800000_01D_MN.rnx', use='G')
     transformer = Transformer.from_crs("EPSG:4978", "EPSG:4326", always_xy=True)
     
     # These states will persist across BOTH files, connecting the path
@@ -242,7 +242,7 @@ def main():
         start_pin.style.labelstyle.scale = 1.0
         start_pin.style.iconstyle.color = 'ff00ff00'
         
-        kml.save("gnss_full_road.kml")
+        kml.save("gnss_full_neighborhood.kml")
         print(f"SUCCESS: Exported {len(df)} points. Maximum yield achieved across BOTH files.")
     else:
         print("No points computed.")
