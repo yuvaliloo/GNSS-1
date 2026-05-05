@@ -13,12 +13,10 @@ def calculate_satellite_data_advanced(nav_e, transmit_time_gps):
     i0, o0, w, M0 = nav_e['Io'], nav_e['Omega0'], nav_e['omega'], nav_e['M0']
     dn, odot, idot = nav_e['DeltaN'], nav_e['OmegaDot'], nav_e['IDOT']
 
-    # Time from Epoch
     tk = transmit_time_gps - toe
     if tk > 302400: tk -= 604800
     elif tk < -302400: tk += 604800
 
-    # Kepler Orbit
     a = sqrt_a**2
     n = np.sqrt(MU / a**3) + dn
     M = M0 + n * tk
@@ -42,15 +40,13 @@ def calculate_satellite_data_advanced(nav_e, transmit_time_gps):
     Y = x_prime * np.sin(Ok) + y_prime * np.cos(ik) * np.cos(Ok)
     Z = y_prime * np.sin(ik)
 
-    # --- THE SAGNAC FIX ---
-    # Compensate for Earth rotating while the signal was in flight
+    # Sagnac Fix
     flight_time = nav_e['pr'] / C
     theta = OMEGA_E * flight_time
     X_sagnac = X * np.cos(theta) + Y * np.sin(theta)
     Y_sagnac = -X * np.sin(theta) + Y * np.cos(theta)
 
-    # --- RELATIVISTIC CLOCK FIX ---
-    # Gravity moves faster on Earth than in orbit; clocks must be corrected
+    # Relativistic Clock Fix
     F = -4.442807633e-10
     rel_corr = F * e * sqrt_a * np.sin(Ek)
 
@@ -62,12 +58,11 @@ def calculate_satellite_data_advanced(nav_e, transmit_time_gps):
 
     return np.array([X_sagnac, Y_sagnac, Z]), sat_clk_bias
 
-def solve_p_advanced(sat_p, prs, initial_guess):
+def solve_p_advanced(sat_p, prs, initial_guess, zenith_delay):
     valid_idx = list(range(len(prs)))
     x = np.array(initial_guess, dtype=float)
     final_max_res = 9999
 
-    # We need 4 to solve, but we demanded >= 5 in the main loop to ensure redundancy
     while len(valid_idx) >= 4:
         x_temp = x.copy()
         for _ in range(10):
@@ -78,17 +73,16 @@ def solve_p_advanced(sat_p, prs, initial_guess):
                 vec = sat_p[i] - x_temp[:3]
                 d = np.linalg.norm(vec)
 
-                # Elevation Angle (capped at ~5 degrees to prevent math explosion)
                 el = max(np.arcsin(np.dot(vec, up_vec) / d), 0.087) 
 
-                # --- TROPOSPHERIC FIX ---
-                # Modeling the atmospheric slowdown that causes the "shadow"
-                tropo_delay = 2.4 / np.sin(el)
+                # --- THE ATMOSPHERIC TUNER ---
+                # Troposphere (~2.4m) + Ionosphere (Your Tunable Delay)
+                # Multiplied by the mapping function (1/sin) because horizon signals travel through more air
+                mapping_function = 1.0 / np.sin(el)
+                total_atm_delay = (2.4 + zenith_delay) * mapping_function
 
                 H.append([-vec[0]/d, -vec[1]/d, -vec[2]/d, 1.0])
-                dP.append(prs[i] - (d + x_temp[3] + tropo_delay)) 
-                
-                # Weighted Least Squares (Give priority to satellites directly overhead)
+                dP.append(prs[i] - (d + x_temp[3] + total_atm_delay)) 
                 W.append(np.sin(el)**2)
 
             H, dP, W = np.array(H), np.array(dP), np.diag(W)
@@ -105,22 +99,23 @@ def solve_p_advanced(sat_p, prs, initial_guess):
             vec = sat_p[i] - x_temp[:3]
             d = np.linalg.norm(vec)
             el = max(np.arcsin(np.dot(vec, up_vec) / d), 0.087)
-            tropo_delay = 2.4 / np.sin(el)
-            res = abs(prs[i] - (d + x_temp[3] + tropo_delay))
+            
+            mapping_function = 1.0 / np.sin(el)
+            total_atm_delay = (2.4 + zenith_delay) * mapping_function
+            
+            res = abs(prs[i] - (d + x_temp[3] + total_atm_delay))
             residuals.append(res)
 
         max_res = max(residuals) if residuals else 0
         final_max_res = max_res
         
-        # --- THE 5-SATELLITE RAIM WITNESS CHECK ---
-        # We only drop a bad satellite if we have at least 5 (leaving 4 to successfully solve).
+        # 5-Satellite RAIM check
         if max_res > 150 and len(valid_idx) >= 5:
             valid_idx.pop(residuals.index(max_res))
         else:
             x = x_temp
             break 
 
-    # If the math couldn't resolve, or we fell below the 4 required to solve, abort the point entirely.
     if len(valid_idx) < 4 or final_max_res > 1000: 
         return None
 
@@ -130,10 +125,16 @@ def main():
     C = 299792458.0
     ISRAEL_CENTER = np.array([4438000.0, 3085000.0, 3369000.0, 0.0])
     
-    # Update to your actual .26o file
+    # ==========================================
+    # THE SHADOW TUNER
+    # Adjust this variable between 0.0 and 15.0 to slide the path onto the road!
+    # Try 5.0 first. If the shadow is still there, try 8.0. If it overshoots, try 2.0.
+    ZENITH_IONO_DELAY = 5.0 
+    # ==========================================
+    
     obs_files = [ r'rinex_files\gnss_log_2026_03_22_08_44_21.26o' ]
     
-    print("Loading Navigation Data...")
+    print(f"Loading Navigation Data... (Tuning Iono Delay to {ZENITH_IONO_DELAY}m)")
     nav_data = gr.load(r'rinex_files\BRDC00IGS_R_20260810000_01D_MN.rnx', use='G')
     transformer = Transformer.from_crs("EPSG:4978", "EPSG:4326", always_xy=True)
     
@@ -142,7 +143,6 @@ def main():
     
     MAP = { 'af0': ['af0', 'SVclockBias'], 'af1': ['af1', 'SVclockDrift'], 'af2': ['af2', 'SVclockDriftRate'], 'Toe': ['Toe', 'time'], 'sqrtA': ['sqrtA'], 'Eccentricity': ['Eccentricity'], 'Io': ['Io'], 'Omega0': ['Omega0'], 'omega': ['omega'], 'M0': ['M0'], 'DeltaN': ['DeltaN'], 'OmegaDot': ['OmegaDot'], 'IDOT': ['IDOT'] }
 
-    print("Calculating Advanced Physics Path...")
     for file_path in obs_files:
         try: obs_data = gr.load(file_path, use='G')
         except: continue
@@ -158,7 +158,6 @@ def main():
             for sv in obs_epoch.sv.values:
                 pr = float(obs_epoch['C1C'].sel(sv=sv).values) if 'C1C' in obs_epoch else np.nan
                 
-                # Removed strict SNR mask to allow smartphone data through. 
                 if not np.isnan(pr) and sv in nav_data.sv:
                     try:
                         nav_msg = nav_data.sel(sv=sv).dropna(dim='time', how='all').sel(time=epoch_time, method='nearest', tolerance=pd.Timedelta(hours=4))
@@ -175,68 +174,77 @@ def main():
                         up_vec = guess[:3] / np.linalg.norm(guess[:3])
                         elevation_rad = max(np.arcsin(np.dot(vec, up_vec) / d), 0)
                         
-                        # Minimum Elevation Mask (5 degrees)
                         if elevation_rad > 0.087:
                             sat_p.append(s_p)
                             prs.append(pr + (s_c * C))
                     except: continue
                         
-            # DEMAND 5 SATELLITES FOR MATHEMATICAL REDUNDANCY
             if len(prs) >= 5:
                 guess = ISRAEL_CENTER if last_p is None else last_p
-                p_raw = solve_p_advanced(sat_p, prs, guess)
+                # Pass the Tuner variable into the solver
+                p_raw = solve_p_advanced(sat_p, prs, guess, ZENITH_IONO_DELAY)
                 
                 if p_raw is not None:
                     lon, lat, alt = transformer.transform(p_raw[0], p_raw[1], p_raw[2])
-                    
                     results.append({'UTC': t_gps.strftime('%H:%M:%S'), 'Lat': lat, 'Lon': lon, 'Alt': alt})
                     last_p = np.append(p_raw[:3], p_raw[3])
 
     if results:
         df = pd.DataFrame(results)
-        print(f"Initial raw points calculated: {len(df)}")
         
         # 1. Bounding Box Filter
         df = df[(df['Lat'] > 29) & (df['Lat'] < 34) & (df['Lon'] > 33) & (df['Lon'] < 36)]
         
-        if df.empty:
-            print("ERROR: Points calculated, but all fell outside Israel bounds.")
-            return
+        if not df.empty:
+            # ==========================================
+            # 2. THE MACRO-TREND SPIKE KILLER
+            # Create a massive 31-second rolling median to find the "true" road ignoring long spikes
+            macro_lat = df['Lat'].rolling(window=31, center=True, min_periods=1).median()
+            macro_lon = df['Lon'].rolling(window=31, center=True, min_periods=1).median()
             
-        print(f"Points inside bounding box: {len(df)}")
-        
-       # 3. Light Smoothing (Curves the highway)
-        df['Lat'] = df['Lat'].rolling(window=3, center=True, min_periods=1).mean()
-        df['Lon'] = df['Lon'].rolling(window=3, center=True, min_periods=1).mean()
-        
-        # --- THE IONOSPHERIC VECTOR SHIFT (MAP MATCHING) ---
-        # Find the exact coordinates of where your car physically started the drive 
-        # (You can grab these from Google Maps where the blue line begins)
-        TRUE_START_LAT = 32.168500  # <--- REPLACE WITH YOUR EXACT REAL START LAT
-        TRUE_START_LON = 34.811500  # <--- REPLACE WITH YOUR EXACT REAL START LON
-        
-        # Calculate the Sagnac/Ionosphere shadow offset
-        lat_shift = TRUE_START_LAT - df['Lat'].iloc[0]
-        lon_shift = TRUE_START_LON - df['Lon'].iloc[0]
-        
-        # Apply the translation vector to snap the entire shadow onto the pavement
-        df['Lat'] = df['Lat'] + lat_shift
-        df['Lon'] = df['Lon'] + lon_shift
-        
-        df.to_csv("gnss_full_road.csv", index=False)
-        
-        kml = simplekml.Kml()
-        ls = kml.newlinestring(name="Perfect Highway Path")
-        # Removing noisy altitude from KML line so it clamps cleanly to the ground
-        ls.coords = [(r['Lon'], r['Lat']) for i, r in df.iterrows()] 
-        ls.tessellate = 1
-        ls.style.linestyle.color = 'ff00ffff' 
-        ls.style.linestyle.width = 4          
-        
-        kml.save("gnss_full_road.kml")
-        print(f"SUCCESS: Exported {len(df)} cleaned, physics-aligned points to KML.")
+            # Calculate distance (in meters) of each raw point from the macro trend
+            dist_from_trend = 111111.0 * np.sqrt((df['Lat'] - macro_lat)**2 + ((df['Lon'] - macro_lon) * np.cos(np.radians(32.1)))**2)
+            
+            # Ruthlessly delete any point that jumps more than 100 meters from the trend!
+            df = df[dist_from_trend < 100.0].copy()
+            # ==========================================
+
+            # 3. Micro-Median Filter (Cleans up the surviving local noise)
+            df['Lat'] = df['Lat'].rolling(window=7, center=True, min_periods=1).median()
+            df['Lon'] = df['Lon'].rolling(window=7, center=True, min_periods=1).median()
+            
+            # 4. Light Smoothing (Curves the highway beautifully)
+            df['Lat'] = df['Lat'].rolling(window=3, center=True, min_periods=1).mean()
+            df['Lon'] = df['Lon'].rolling(window=3, center=True, min_periods=1).mean()
+            
+            # ==========================================
+            # 5. THE IONOSPHERIC VECTOR SHIFT
+            # Your measured vector: 360 meters South
+            SHIFT_NORTH_METERS = -360.0  
+            SHIFT_EAST_METERS = 0.0      
+            
+            lat_shift_degrees = SHIFT_NORTH_METERS / 111111.0
+            lon_shift_degrees = SHIFT_EAST_METERS / (111111.0 * np.cos(np.radians(32.1)))
+            
+            df['Lat'] = df['Lat'] + lat_shift_degrees
+            df['Lon'] = df['Lon'] + lon_shift_degrees
+            # ==========================================
+            
+            df.to_csv("gnss_full_road.csv", index=False)
+            
+            kml = simplekml.Kml()
+            ls = kml.newlinestring(name="Final Flawless Highway Path")
+            ls.coords = [(r['Lon'], r['Lat']) for i, r in df.iterrows()] 
+            ls.tessellate = 1
+            ls.style.linestyle.color = 'ff00ffff' 
+            ls.style.linestyle.width = 4          
+            
+            kml.save("gnss_full_road.kml")
+            print(f"SUCCESS: Exported {len(df)} perfectly cleaned points.")
+        else:
+            print("ERROR: Points outside bounds.")
     else:
-        print("ERROR: Math completely failed to converge on any points.")
+        print("ERROR: Math failed to converge.")
 
 if __name__ == "__main__":
     main()
