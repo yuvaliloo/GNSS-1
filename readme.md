@@ -22,7 +22,7 @@ The pipeline operates in 5 distinct phases to transform raw radio measurements i
 * **Parsing:** The script parses the RINEX `.26o` (Observation) files and the BRDC Navigation file.
 * **Synchronization:** It converts epoch timestamps into GPS Time of Week (TOW) to synchronize the receivers local clock with the satellite constellation time.
 
-### ⚙️ 2. Advanced Physics Engine
+### 2. Advanced Physics Engine
 We calculate the satellite positions using a high-fidelity model:
 
 * **Keplerian Orbit Math**: Deriving precise satellite locations.
@@ -30,18 +30,18 @@ We calculate the satellite positions using a high-fidelity model:
 * **Relativistic Correction**: Applying the General Relativity clock drift correction (critical for meter-level accuracy).
 * **Tropospheric Delay**: Using a zenith delay model combined with a mapping function to account for atmospheric signal slowing.
 
-### ⚙️ 3. Position Solving & Integrity (RAIM)
+### 3. Position Solving & Integrity (RAIM)
 
 * **Weighted Least Squares (WLS)**: The solver intersects satellite range spheres to mathematically determine your precise coordinates.
 * **RAIM (Receiver Autonomous Integrity Monitoring)**: We enforce a 5-satellite minimum constraint. If the geometry yields high residuals, the solver identifies and drops the "liar" satellite (the one causing the most error) and re-solves, ensuring that a single bouncing signal cannot ruin the position.
 
-### ⚙️ 4. Noise Filtering
+### 4. Noise Filtering
 
 * **Macro-Trend Filter**: A 31-second rolling median is used to find the "center of gravity" of your path. Any raw point deviating > 100m from this macro-trend is ruthlessly deleted to kill ocean/building spikes.
 * **Micro-Median Filter**: A 7-second rolling median cleans up local jitters.
 * **Smoothing**: A 3-second moving average curves the path naturally to match road geometry.
 
-### ⚙️ 5. Vector Translation (The "Shadow" Snap)
+### 5. Vector Translation (The "Shadow" Snap)
 Atmospheric conditions often create a systematic bias ("shadow") where the track is perfect in shape but shifted from the road.
 
 * **Static Vector Shift**: The script applies a calculated coordinate translation to snap the entire dataset onto the correct pavement.
